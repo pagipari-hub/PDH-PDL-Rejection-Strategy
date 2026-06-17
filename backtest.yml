@@ -1,0 +1,37 @@
+name: PDH-PDL Backtest
+
+on:
+  workflow_dispatch:        # manual trigger from the Actions tab
+  # schedule:
+  #   - cron: "30 3 * * 1-5"   # uncomment to run automatically, 9:00 AM IST on weekdays
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run backtest
+        env:
+          ANGEL_CLIENT_ID: ${{ secrets.ANGEL_CLIENT_ID }}
+          ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
+          ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
+          ANGEL_MPIN: ${{ secrets.ANGEL_MPIN }}
+        run: python pdh_pdl_backtest.py
+
+      - name: Upload trade log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-log
+          path: trade_log.csv
+          if-no-files-found: warn
