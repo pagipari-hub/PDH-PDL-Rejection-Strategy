@@ -94,7 +94,7 @@ class Config:
     CHUNK_DAYS = 30
 
     # --- Rate-limit friendliness for Angel One historical API ---
-    REQUEST_SLEEP_SEC = 1.0      # pause between every request, regardless of outcome
+    REQUEST_SLEEP_SEC = 3.5      # pause between every request, regardless of outcome
     MAX_RETRIES = 8              # retries specifically for rate-limit / transient errors
     RETRY_BACKOFF_SEC = 5.0      # base backoff, multiplied by attempt number (linear backoff)
     RATE_LIMIT_SLEEP_SEC = 45    # extra sleep specifically when a rate-limit message is detected
