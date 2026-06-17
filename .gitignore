@@ -1,0 +1,7 @@
+candle_cache/
+instrument_master.csv
+trade_log.csv
+__pycache__/
+*.pyc
+test_candle_cache_tmp/
+test_instrument_master_tmp.csv
