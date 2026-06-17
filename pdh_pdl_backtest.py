@@ -87,10 +87,28 @@ class Config:
     CANDLE_INTERVAL = "FIVE_MINUTE"   # Angel One interval code
     EXCHANGE = "NSE"
 
-    # Rate-limit friendliness for Angel One historical API
-    REQUEST_SLEEP_SEC = 0.4
-    MAX_RETRIES = 4
-    RETRY_BACKOFF_SEC = 2.0
+    # --- Historical fetch chunking ---
+    # Angel One's documented limit for FIVE_MINUTE interval is ~30 days per
+    # request (longer intervals allow more, shorter intervals allow less).
+    # We use 30 to minimize total request count.
+    CHUNK_DAYS = 30
+
+    # --- Rate-limit friendliness for Angel One historical API ---
+    REQUEST_SLEEP_SEC = 1.0      # pause between every request, regardless of outcome
+    MAX_RETRIES = 8              # retries specifically for rate-limit / transient errors
+    RETRY_BACKOFF_SEC = 5.0      # base backoff, multiplied by attempt number (linear backoff)
+    RATE_LIMIT_SLEEP_SEC = 45    # extra sleep specifically when a rate-limit message is detected
+    RATE_LIMIT_MARKERS = (
+        "exceeding access rate",
+        "access denied",
+        "rate limit",
+        "too many requests",
+    )
+
+    # --- Caching ---
+    CANDLE_CACHE_DIR = "candle_cache"
+    INSTRUMENT_MASTER_CACHE_PATH = "instrument_master.csv"
+    INSTRUMENT_MASTER_MAX_AGE_HOURS = 24  # refresh once per day
 
 
 # ============================================================================
@@ -174,10 +192,21 @@ INSTRUMENT_MASTER_URL = (
 )
 
 
-def load_instrument_master() -> pd.DataFrame:
-    """Downloads Angel One's instrument master and returns it as a DataFrame.
-    Used to map trading symbols (e.g. 'RELIANCE') to the numeric tokens the
-    historical API requires."""
+def load_instrument_master(force_refresh: bool = False) -> pd.DataFrame:
+    """Returns Angel One's instrument master as a DataFrame, using a local
+    CSV cache that's refreshed at most once every
+    Config.INSTRUMENT_MASTER_MAX_AGE_HOURS hours (default 24h). This avoids
+    re-downloading the (fairly large) instrument master on every run."""
+    cache_path = Config.INSTRUMENT_MASTER_CACHE_PATH
+
+    if not force_refresh and os.path.exists(cache_path):
+        age_hours = (time.time() - os.path.getmtime(cache_path)) / 3600.0
+        if age_hours < Config.INSTRUMENT_MASTER_MAX_AGE_HOURS:
+            log.info("Loading instrument master from cache (%.1fh old)", age_hours)
+            return pd.read_csv(cache_path, dtype={"token": str})
+        else:
+            log.info("Instrument master cache is stale (%.1fh old), refreshing", age_hours)
+
     import urllib.request
 
     log.info("Downloading Angel One instrument master...")
@@ -188,7 +217,11 @@ def load_instrument_master() -> pd.DataFrame:
     # Equity cash-market symbols carry the '-EQ' suffix in Angel One's master
     df = df[(df["exch_seg"] == "NSE") & (df["symbol"].str.endswith("-EQ"))]
     df["base_symbol"] = df["symbol"].str.replace("-EQ", "", regex=False)
-    return df[["token", "symbol", "base_symbol", "name", "lotsize"]]
+    df = df[["token", "symbol", "base_symbol", "name", "lotsize"]]
+
+    df.to_csv(cache_path, index=False)
+    log.info("Instrument master cached to %s (%d rows)", cache_path, len(df))
+    return df
 
 
 def build_symbol_token_map(symbols: list[str]) -> dict[str, str]:
@@ -212,6 +245,18 @@ def build_symbol_token_map(symbols: list[str]) -> dict[str, str]:
 # HISTORICAL CANDLE FETCH
 # ============================================================================
 
+def _is_rate_limit_response(resp_or_error: object) -> bool:
+    """Checks an API response dict or exception/string for known Angel One
+    rate-limit phrasing, so we can react differently (longer sleep) than a
+    generic transient error."""
+    text = ""
+    if isinstance(resp_or_error, dict):
+        text = json.dumps(resp_or_error).lower()
+    else:
+        text = str(resp_or_error).lower()
+    return any(marker in text for marker in Config.RATE_LIMIT_MARKERS)
+
+
 def fetch_historical_candles(
     smart_api: SmartConnect,
     token: str,
@@ -220,13 +265,15 @@ def fetch_historical_candles(
     interval: str = Config.CANDLE_INTERVAL,
 ) -> pd.DataFrame:
     """Fetches historical candles for a single instrument token between
-    from_dt and to_dt, with retry handling for transient HTTP/502 errors.
-    Angel One limits each request to ~30 days of 5-min data, so this
-    function internally chunks the date range and concatenates results."""
+    from_dt and to_dt, with retry handling for transient HTTP/502 errors AND
+    dedicated handling for Angel One's rate-limit responses ("Access denied
+    because of exceeding access rate"). Angel One limits each request to
+    roughly Config.CHUNK_DAYS days of 5-min data, so this function
+    internally chunks the date range and concatenates results."""
 
     all_rows = []
     chunk_start = from_dt
-    chunk_size = dt.timedelta(days=25)  # stay safely under Angel One's ~30 day cap
+    chunk_size = dt.timedelta(days=Config.CHUNK_DAYS)
 
     while chunk_start < to_dt:
         chunk_end = min(chunk_start + chunk_size, to_dt)
@@ -243,23 +290,51 @@ def fetch_historical_candles(
         for attempt in range(1, Config.MAX_RETRIES + 1):
             try:
                 resp = smart_api.getCandleData(params)
+
                 if resp and resp.get("status") and resp.get("data"):
                     rows = resp["data"]
                     break
-                else:
+
+                if _is_rate_limit_response(resp):
                     log.warning(
-                        "Empty/failed response for token %s [%s -> %s] (attempt %d): %s",
-                        token, chunk_start.date(), chunk_end.date(), attempt, resp,
+                        "RATE LIMIT hit for token %s [%s -> %s] (attempt %d). "
+                        "Sleeping %ds before retry.",
+                        token, chunk_start.date(), chunk_end.date(),
+                        attempt, Config.RATE_LIMIT_SLEEP_SEC,
                     )
+                    time.sleep(Config.RATE_LIMIT_SLEEP_SEC)
+                    continue  # don't count this against the normal backoff curve below
+
+                log.warning(
+                    "Empty/failed response for token %s [%s -> %s] (attempt %d): %s",
+                    token, chunk_start.date(), chunk_end.date(), attempt, resp,
+                )
+
             except Exception as e:
+                if _is_rate_limit_response(e):
+                    log.warning(
+                        "RATE LIMIT exception for token %s [%s -> %s] (attempt %d): %s. "
+                        "Sleeping %ds before retry.",
+                        token, chunk_start.date(), chunk_end.date(),
+                        attempt, e, Config.RATE_LIMIT_SLEEP_SEC,
+                    )
+                    time.sleep(Config.RATE_LIMIT_SLEEP_SEC)
+                    continue
                 log.warning(
                     "Error fetching candles for token %s [%s -> %s] (attempt %d): %s",
                     token, chunk_start.date(), chunk_end.date(), attempt, e,
                 )
+
+            # Generic transient-error backoff (linear w/ attempt number)
             time.sleep(Config.RETRY_BACKOFF_SEC * attempt)
 
         if rows:
             all_rows.extend(rows)
+        else:
+            log.error(
+                "Giving up on chunk [%s -> %s] for token %s after %d attempts",
+                chunk_start.date(), chunk_end.date(), token, Config.MAX_RETRIES,
+            )
 
         time.sleep(Config.REQUEST_SLEEP_SEC)
         chunk_start = chunk_end
@@ -268,7 +343,11 @@ def fetch_historical_candles(
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
     df = pd.DataFrame(all_rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    # Angel One returns timestamps with a +05:30 offset (e.g. "...T09:15:00+05:30").
+    # We normalize to timezone-naive IST wall-clock time so all downstream
+    # comparisons (cache gap detection, market-window checks, etc.) are
+    # consistent with the naive datetimes used elsewhere in this script.
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=False).dt.tz_localize(None)
     df = df.drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -280,7 +359,9 @@ def fetch_all_symbols(
     token_map: dict[str, str],
     lookback_days: int = Config.LOOKBACK_DAYS,
 ) -> dict[str, pd.DataFrame]:
-    """Fetches historical 5-min candles for every symbol in token_map."""
+    """Fetches historical 5-min candles for every symbol in token_map (no
+    caching -- use load_or_fetch_all_symbols for the incremental-cache
+    version used by main())."""
     to_dt = dt.datetime.now().replace(hour=15, minute=30, second=0, microsecond=0)
     from_dt = to_dt - dt.timedelta(days=lookback_days)
 
@@ -296,14 +377,35 @@ def fetch_all_symbols(
 
 
 # ============================================================================
-# LOCAL CACHE (avoid re-downloading on every run)
+# LOCAL CACHE (incremental, CSV-based)
 # ============================================================================
+# Goal: first run downloads the full lookback window per symbol (slow, many
+# requests). Every subsequent run only fetches candles AFTER the last
+# cached timestamp, so a daily re-run is fast and uses far fewer API calls.
+# Cache files are plain CSV (not pickle) so they're diffable/inspectable and
+# trivially portable as a GitHub Actions artifact between runs.
 
-CACHE_DIR = "candle_cache"
+CANDLE_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 
 
-def cache_path(symbol: str) -> str:
-    return os.path.join(CACHE_DIR, f"{symbol}.pkl")
+def candle_cache_path(symbol: str) -> str:
+    return os.path.join(Config.CANDLE_CACHE_DIR, f"{symbol}.csv")
+
+
+def _read_cached_candles(symbol: str) -> pd.DataFrame:
+    path = candle_cache_path(symbol)
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=CANDLE_COLUMNS)
+    df = pd.read_csv(path, parse_dates=["timestamp"])
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def _write_cached_candles(symbol: str, df: pd.DataFrame) -> None:
+    os.makedirs(Config.CANDLE_CACHE_DIR, exist_ok=True)
+    df = df.drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+    df.to_csv(candle_cache_path(symbol), index=False)
 
 
 def load_or_fetch_all_symbols(
@@ -312,32 +414,61 @@ def load_or_fetch_all_symbols(
     lookback_days: int = Config.LOOKBACK_DAYS,
     force_refresh: bool = False,
 ) -> dict[str, pd.DataFrame]:
-    """Like fetch_all_symbols, but caches each symbol's data to disk so that
-    re-running the backtest doesn't re-hit the API unnecessarily. Cache is
-    considered stale (re-fetched) if it doesn't cover up to 'today'."""
-    os.makedirs(CACHE_DIR, exist_ok=True)
+    """For each symbol:
+      - No cache (or force_refresh=True): download the full lookback window
+        and write it to CSV.
+      - Cache exists: read the last cached timestamp and fetch only candles
+        from (last_timestamp + 5 minutes) up to now, then append + dedupe +
+        re-save. This is what makes subsequent runs fast (typically a
+        handful of candles per symbol instead of months of history).
+
+    Returns {symbol: full_dataframe_including_cache}.
+    """
+    os.makedirs(Config.CANDLE_CACHE_DIR, exist_ok=True)
     to_dt = dt.datetime.now().replace(hour=15, minute=30, second=0, microsecond=0)
-    from_dt = to_dt - dt.timedelta(days=lookback_days)
+    full_from_dt = to_dt - dt.timedelta(days=lookback_days)
 
     data = {}
+    n = len(token_map)
     for i, (sym, token) in enumerate(token_map.items(), 1):
-        path = cache_path(sym)
-        if not force_refresh and os.path.exists(path):
-            df = pd.read_pickle(path)
-            last_ts = df["timestamp"].max() if not df.empty else None
-            if last_ts is not None and (to_dt.date() - last_ts.date()).days <= 1:
-                log.info("[%d/%d] %s loaded from cache (%d rows)",
-                         i, len(token_map), sym, len(df))
-                data[sym] = df
-                continue
+        cached_df = pd.DataFrame(columns=CANDLE_COLUMNS) if force_refresh else _read_cached_candles(sym)
 
-        log.info("[%d/%d] Fetching %s (token=%s)...", i, len(token_map), sym, token)
-        df = fetch_historical_candles(smart_api, token, from_dt, to_dt)
-        if df.empty:
-            log.warning("No data returned for %s, skipping.", sym)
+        if cached_df.empty:
+            log.info("[%d/%d] %s: no cache found, fetching full %d-day history...",
+                      i, n, sym, lookback_days)
+            new_df = fetch_historical_candles(smart_api, token, full_from_dt, to_dt)
+            if new_df.empty:
+                log.warning("No data returned for %s, skipping.", sym)
+                continue
+            _write_cached_candles(sym, new_df)
+            data[sym] = new_df
             continue
-        df.to_pickle(path)
-        data[sym] = df
+
+        last_ts = cached_df["timestamp"].max()
+        gap_start = last_ts + dt.timedelta(minutes=5)
+
+        if gap_start >= to_dt:
+            log.info("[%d/%d] %s: cache already up to date (last candle %s), skipping fetch",
+                      i, n, sym, last_ts)
+            data[sym] = cached_df
+            continue
+
+        log.info("[%d/%d] %s: cache found (last candle %s), fetching only the gap -> %s",
+                  i, n, sym, last_ts, to_dt)
+        new_df = fetch_historical_candles(smart_api, token, gap_start, to_dt)
+
+        if new_df.empty:
+            log.info("[%d/%d] %s: no new candles in the gap (market closed / holiday?)", i, n, sym)
+            data[sym] = cached_df
+            continue
+
+        combined = pd.concat([cached_df, new_df], ignore_index=True)
+        combined = combined.drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+        _write_cached_candles(sym, combined)
+        log.info("[%d/%d] %s: appended %d new candle(s), cache now has %d rows",
+                  i, n, sym, len(new_df), len(combined))
+        data[sym] = combined
+
     return data
 
 
