@@ -1,4 +1,5 @@
 candle_cache/
+daily_candle_cache/
 instrument_master.csv
 trade_log.csv
 __pycache__/
