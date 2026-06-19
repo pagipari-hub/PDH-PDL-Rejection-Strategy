@@ -36,6 +36,7 @@ jobs:
         with:
           path: |
             candle_cache/
+            daily_candle_cache/
             instrument_master.csv
           key: pdh-pdl-candle-cache-${{ github.run_id }}
           restore-keys: |
