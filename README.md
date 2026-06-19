@@ -22,6 +22,21 @@ historical 5-min candle data.
 - **Position sizing:** fixed risk per trade (₹1000 default), quantity =
   risk ÷ |entry − SL|
 
+### Daily RSI (analysis / not yet an active filter)
+
+Each trade also records the **previous trading day's** daily RSI(14) at
+the rejection candle's date — `RSI > 60` for PDH (short) rejections,
+`RSI < 40` for PDL (long) rejections is the hypothesis being tested
+(overbought/oversold confirmation for the rejection). Using the *previous*
+day's RSI (not the current, still-forming day) avoids lookahead bias: at
+9:15 AM the current day's daily candle hasn't closed yet.
+
+This is currently recorded for analysis (visible as the `rsi` column in
+`trade_log.csv`, plus a `RSI condition MET` / `NOT met` breakdown printed
+in the run summary) but is **not yet wired in as a hard entry filter** —
+that's a deliberate next step once the backtest results confirm whether it
+actually improves performance.
+
 ## Setup
 
 1. Add these as **GitHub repo secrets** (Settings → Secrets and variables →
@@ -62,25 +77,28 @@ export ANGEL_MPIN=...
 python pdh_pdl_backtest.py
 ```
 
-Locally, the cache just lives on disk in `candle_cache/` and
-`instrument_master.csv` — no special setup needed, it'll incrementally
-update on every run automatically.
+Locally, the cache just lives on disk in `candle_cache/`,
+`daily_candle_cache/` and `instrument_master.csv` — no special setup
+needed, it'll incrementally update on every run automatically.
 
 ## Files
 
 - `pdh_pdl_backtest.py` — main backtest engine (auth, incremental data
-  fetch/cache, indicators, strategy state machine, portfolio concurrency
-  filter, reporting)
+  fetch/cache for both 5-min and daily candles, indicators including daily
+  RSI, strategy state machine, portfolio concurrency filter, reporting)
 - `test_strategy_logic.py` — synthetic-data unit tests validating the
   rejection → VWAP-cross → entry → SL/Target1/trail logic for both long and
   short setups
 - `test_data_layer.py` — unit tests for the incremental CSV cache, rate-limit
   detection/retry behavior, and instrument master caching, using a mocked
   Angel One API (no real network access needed)
+- `test_rsi_logic.py` — unit tests for the daily RSI(14) calculation
+  (cross-checked against known pure-uptrend/downtrend cases) and the
+  previous-day attachment logic (verifies no lookahead bias)
 - `requirements.txt` — Python dependencies
 - `.github/workflows/backtest.yml` — GitHub Actions workflow (manual
   trigger; scheduled run commented out, uncomment if you want it automatic).
-  Includes `actions/cache` steps to persist the candle cache between runs.
+  Includes `actions/cache` steps to persist both candle caches between runs.
 - `.gitignore` — keeps cache files and trade logs out of git (they're
   persisted via the GitHub Actions cache instead, not committed)
 

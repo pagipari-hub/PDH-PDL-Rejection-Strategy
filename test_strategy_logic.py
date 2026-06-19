@@ -98,7 +98,9 @@ RR achieved   : {t.rr_achieved}
     t = trades[0]
     assert t.side == "LONG"
     assert abs(t.entry_price - 98.10) < 0.01, f"Unexpected entry price: {t.entry_price}"
-    assert t.sl_price == 90, f"Unexpected SL: {t.sl_price}"
+    # SL is now the low of the candle BEFORE the fill candle (09:30 fills,
+    # so entry-1 = 09:25, whose low is 91), not the old static PDL(90).
+    assert t.sl_price == 91, f"Unexpected SL: {t.sl_price}"
     assert t.hit_target1 is True
     assert t.exit_reason == "TARGET1_TRAIL_EXIT"
     assert t.pnl > 0, "Expected a winning trade in this scenario"
@@ -149,7 +151,11 @@ def test_short_scenario():
     assert len(trades) == 1
     t = trades[0]
     assert t.side == "SHORT"
-    assert t.sl_price == 110
+    # SL is now the high of the candle BEFORE the fill candle. The VWAP-cross
+    # trigger actually fires at 09:20 (close=107, crossing below vwap) here --
+    # entry fills at 09:30 isn't right either; print output shows entry=106.9,
+    # so entry-1 is the 09:20 candle (high=109).
+    assert t.sl_price == 109, f"Unexpected SL: {t.sl_price}"
     assert t.hit_target1 is True
     assert t.exit_reason == "TARGET1_TRAIL_EXIT"
     assert t.pnl > 0

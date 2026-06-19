@@ -110,6 +110,16 @@ class Config:
     INSTRUMENT_MASTER_CACHE_PATH = "instrument_master.csv"
     INSTRUMENT_MASTER_MAX_AGE_HOURS = 24  # refresh once per day
 
+    # --- Daily RSI (for analysis/filtering: PDH rejection wants RSI > 60,
+    #     PDL rejection wants RSI < 40, applied using the PREVIOUS day's
+    #     RSI value to avoid lookahead bias) ---
+    DAILY_CANDLE_INTERVAL = "ONE_DAY"
+    DAILY_LOOKBACK_DAYS = 250     # extra history so RSI(14) has a proper warmup
+    RSI_PERIOD = 14
+    RSI_PDH_SHORT_THRESHOLD = 60  # PDH rejection (short) wants RSI > 60
+    RSI_PDL_LONG_THRESHOLD = 40   # PDL rejection (long) wants RSI < 40
+    DAILY_CANDLE_CACHE_DIR = "daily_candle_cache"
+
 
 # ============================================================================
 # NIFTY 200 UNIVERSE
@@ -130,7 +140,7 @@ NIFTY_200_SYMBOLS = [
     "VEDL", "PIDILITIND", "GODREJCP", "HAVELLS", "DABUR", "SIEMENS",
     "ADANIGREEN", "DLF", "TATACONSUM", "AMBUJACEM", "BANKBARODA",
     "CHOLAFIN", "GAIL", "ICICIPRULI", "ICICIGI", "TVSMOTOR", "BPCL",
-    "INDIGO", "ETERNAL", "VBL", "LTM", "SRF", "MARICO", "PNB", "CANBK",
+    "INDIGO", "ZOMATO", "VBL", "LTIM", "SRF", "MARICO", "PNB", "CANBK",
     "PFC", "RECLTD", "TORNTPHARM", "BOSCHLTD", "HAL", "MOTHERSON",
     "PIIND", "BERGEPAINT", "JINDALSTEL", "MUTHOOTFIN", "LUPIN", "UPL",
     "AUROPHARMA", "COLPAL", "ASHOKLEY", "POLYCAB", "MPHASIS", "INDUSTOWER",
@@ -138,22 +148,22 @@ NIFTY_200_SYMBOLS = [
     "PETRONET", "GUJGASLTD", "ESCORTS", "VOLTAS", "PERSISTENT", "COFORGE",
     "SAIL", "NMDC", "BANDHANBNK", "FEDERALBNK", "IDFCFIRSTB", "AUBANK",
     "BANKINDIA", "UNIONBANK", "INDHOTEL", "OBEROIRLTY", "GODREJPROP",
-    "PRESTIGE", "PHOENIXLTD", "LODHA", "MFSL", "SHRIRAMFIN", "LTF",
+    "PRESTIGE", "PHOENIXLTD", "LODHA", "MFSL", "SHRIRAMFIN", "L&TFH",
     "TIINDIA", "SUPREMEIND", "ASTRAL", "CUMMINSIND", "SCHAEFFLER",
     "TIMKEN", "AIAENG", "KEI", "RVNL", "IRFC", "CONCOR", "IRCTC",
     "BHEL", "BDL", "HUDCO", "NHPC", "SJVN", "TATAPOWER", "ADANIPOWER",
     "JSWENERGY", "TORNTPOWER", "CESC", "NLCINDIA", "IEX", "MAZDOCK",
-    "COCHINSHIP", "GRSE", "GMRAIRPORT", "IGL", "ATGL", "GUJGASLTD",
+    "COCHINSHIP", "GRSE", "GMRAIRPORT", "IGL", "ATGL", "GSPL",
     "DEEPAKNTR", "AARTIIND", "TATACHEM", "NAVINFLUOR", "FLUOROCHEM",
     "LAURUSLABS", "GLENMARK", "ZYDUSLIFE", "BIOCON", "IPCALAB",
-    "ABBOTINDIA", "SANOFI", "PFIZER", "GLAXO", "SYNGENE", "MANKIND",
+    "ABBOTINDIA", "SANOFI", "PFIZER", "GSK", "SYNGENE", "MANKIND",
     "POLICYBZR", "PAYTM", "NYKAA", "DELHIVERY", "DMART", "TRIDENT",
     "PAGEIND", "RAYMOND", "ABFRL", "KALYANKJIL", "RAJESHEXPO",
     "TITAGARH", "JYOTHYLAB", "EMAMILTD", "GILLETTE", "VGUARD",
     "WHIRLPOOL", "CROMPTON", "AMBER", "DIXON", "KAYNES", "SYRMA",
-    "CYIENT", "TATAELXSI", "KPITTECH", "LTTS", "HEXW", "FSL",
+    "CYIENT", "TATAELXSI", "KPITTECH", "LTTS", "HEXAWARE", "FIRSTSOURCE",
     "BSOFT", "NIITLTD", "ZENSARTECH", "SONACOMS", "BHARATFORG",
-    "MRF", "APOLLOTYRE", "CEATLTD", "EXIDEIND", "ARE&M",
+    "MRF", "APOLLOTYRE", "CEAT", "EXIDEIND", "AMARAJABAT",
 ]
 # Deduplicate while preserving order
 NIFTY_200_SYMBOLS = list(dict.fromkeys(NIFTY_200_SYMBOLS))
@@ -473,6 +483,134 @@ def load_or_fetch_all_symbols(
 
 
 # ============================================================================
+# DAILY CANDLES (for RSI calculation) — incremental CSV cache, same pattern
+# as the 5-min candle cache above, but using Config.DAILY_CANDLE_INTERVAL
+# and a longer lookback so RSI(14) has a proper warmup period.
+# ============================================================================
+
+def daily_candle_cache_path(symbol: str) -> str:
+    return os.path.join(Config.DAILY_CANDLE_CACHE_DIR, f"{symbol}.csv")
+
+
+def _read_cached_daily_candles(symbol: str) -> pd.DataFrame:
+    path = daily_candle_cache_path(symbol)
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=CANDLE_COLUMNS)
+    df = pd.read_csv(path, parse_dates=["timestamp"])
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def _write_cached_daily_candles(symbol: str, df: pd.DataFrame) -> None:
+    os.makedirs(Config.DAILY_CANDLE_CACHE_DIR, exist_ok=True)
+    df = df.drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+    df.to_csv(daily_candle_cache_path(symbol), index=False)
+
+
+def load_or_fetch_daily_candles(
+    smart_api: SmartConnect,
+    token_map: dict[str, str],
+    lookback_days: int = Config.DAILY_LOOKBACK_DAYS,
+    force_refresh: bool = False,
+) -> dict[str, pd.DataFrame]:
+    """Same incremental-cache pattern as load_or_fetch_all_symbols, but for
+    daily candles (Config.DAILY_CANDLE_INTERVAL), used purely to compute
+    RSI(14) on daily closes. Cached separately under
+    Config.DAILY_CANDLE_CACHE_DIR so it doesn't collide with the 5-min cache."""
+    os.makedirs(Config.DAILY_CANDLE_CACHE_DIR, exist_ok=True)
+    to_dt = dt.datetime.now().replace(hour=15, minute=30, second=0, microsecond=0)
+    full_from_dt = to_dt - dt.timedelta(days=lookback_days)
+
+    data = {}
+    n = len(token_map)
+    for i, (sym, token) in enumerate(token_map.items(), 1):
+        cached_df = pd.DataFrame(columns=CANDLE_COLUMNS) if force_refresh else _read_cached_daily_candles(sym)
+
+        if cached_df.empty:
+            log.info("[daily %d/%d] %s: no cache found, fetching full %d-day daily history...",
+                      i, n, sym, lookback_days)
+            new_df = fetch_historical_candles(
+                smart_api, token, full_from_dt, to_dt, interval=Config.DAILY_CANDLE_INTERVAL
+            )
+            if new_df.empty:
+                log.warning("No daily data returned for %s, skipping.", sym)
+                continue
+            _write_cached_daily_candles(sym, new_df)
+            data[sym] = new_df
+            continue
+
+        last_ts = cached_df["timestamp"].max()
+        gap_start = last_ts + dt.timedelta(days=1)
+
+        if gap_start.date() >= to_dt.date():
+            log.info("[daily %d/%d] %s: cache already up to date (last candle %s)",
+                      i, n, sym, last_ts)
+            data[sym] = cached_df
+            continue
+
+        log.info("[daily %d/%d] %s: cache found (last candle %s), fetching gap -> %s",
+                  i, n, sym, last_ts, to_dt)
+        new_df = fetch_historical_candles(
+            smart_api, token, gap_start, to_dt, interval=Config.DAILY_CANDLE_INTERVAL
+        )
+
+        if new_df.empty:
+            data[sym] = cached_df
+            continue
+
+        combined = pd.concat([cached_df, new_df], ignore_index=True)
+        combined = combined.drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+        _write_cached_daily_candles(sym, combined)
+        data[sym] = combined
+
+    return data
+
+
+def compute_daily_rsi(daily_df: pd.DataFrame, period: int = Config.RSI_PERIOD) -> pd.DataFrame:
+    """Computes Wilder's RSI(period) on daily closes. Returns a DataFrame
+    with columns ['date', 'rsi'] where 'rsi' is that day's RSI value based
+    on closes up to and including that day."""
+    if daily_df.empty:
+        return pd.DataFrame(columns=["date", "rsi"])
+
+    d = daily_df.copy().sort_values("timestamp").reset_index(drop=True)
+    delta = d["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    # Wilder's smoothing (equivalent to an EMA with alpha = 1/period)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    # When avg_loss is 0 but avg_gain isn't, RSI should be 100 (all gains, no losses)
+    rsi = rsi.where(~((avg_loss == 0) & (avg_gain > 0)), 100)
+
+    out = pd.DataFrame({"date": d["timestamp"].dt.date, "rsi": rsi})
+    return out
+
+
+def attach_prev_day_rsi(intraday_df: pd.DataFrame, daily_rsi_df: pd.DataFrame) -> pd.DataFrame:
+    """Attaches a 'rsi' column to the 5-min candle DataFrame, using the
+    PREVIOUS trading day's daily RSI value for every candle on a given day
+    (point-in-time correct: at 9:15 AM we only know yesterday's close-based
+    RSI, not today's, since today's daily candle isn't formed yet)."""
+    df = intraday_df.copy()
+    if daily_rsi_df.empty:
+        df["rsi"] = np.nan
+        return df
+
+    rsi_lookup = daily_rsi_df.copy().sort_values("date").reset_index(drop=True)
+    rsi_lookup["rsi_prev_day"] = rsi_lookup["rsi"].shift(1)
+    rsi_map = rsi_lookup.set_index("date")["rsi_prev_day"]
+
+    df["rsi"] = df["date"].map(rsi_map)
+    return df
+
+
+# ============================================================================
 # INDICATORS: VWAP (daily reset) and PDH/PDL
 # ============================================================================
 
@@ -526,6 +664,7 @@ class Trade:
     pnl: float = None
     rr_achieved: float = None
     planned_rr: float = None
+    rsi: float = None          # previous day's daily RSI(14) at rejection time (for analysis/filtering)
 
 
 # ============================================================================
@@ -670,6 +809,8 @@ def build_long_trade(symbol: str, df: pd.DataFrame, trigger_idx: int,
     if (target_price - entry_price) / risk < Config.MIN_RR:
         return None  # RR filter: skip trade entirely
 
+    rejection_rsi = df.loc[rejection_idx, "rsi"] if "rsi" in df.columns else None
+
     return Trade(
         symbol=symbol,
         side="LONG",
@@ -680,6 +821,7 @@ def build_long_trade(symbol: str, df: pd.DataFrame, trigger_idx: int,
         sl_price=round(sl_price, 2),
         target_price=round(target_price, 2),
         planned_rr=planned_rr,
+        rsi=round(rejection_rsi, 2) if pd.notna(rejection_rsi) else None,
     )
 
 
@@ -701,6 +843,8 @@ def build_short_trade(symbol: str, df: pd.DataFrame, trigger_idx: int,
     if (entry_price - target_price) / risk < Config.MIN_RR:
         return None
 
+    rejection_rsi = df.loc[rejection_idx, "rsi"] if "rsi" in df.columns else None
+
     return Trade(
         symbol=symbol,
         side="SHORT",
@@ -711,6 +855,7 @@ def build_short_trade(symbol: str, df: pd.DataFrame, trigger_idx: int,
         sl_price=round(sl_price, 2),
         target_price=round(target_price, 2),
         planned_rr=planned_rr,
+        rsi=round(rejection_rsi, 2) if pd.notna(rejection_rsi) else None,
     )
 
 
@@ -741,7 +886,26 @@ def simulate_entry_and_exit(df: pd.DataFrame, trigger_idx: int, trade: Trade) ->
 
     trade.entry_time = df.loc[entry_idx, "timestamp"]
 
-    # Fixed-risk position sizing
+    # --- Live SL: replace the original PDH/PDL level with the low (long) /
+    # high (short) of the candle immediately BEFORE the fill candle, now
+    # that we know which candle actually filled. Note this only affects the
+    # *live* SL used for trade management/sizing below -- the target price
+    # and the MIN_RR filter (already applied in build_long_trade /
+    # build_short_trade, using the original PDH/PDL-based risk) are
+    # intentionally left untouched.
+    prefill_row = df.loc[entry_idx - 1]
+    new_sl = prefill_row["low"] if is_long else prefill_row["high"]
+
+    # Guard: the entry-1 candle's low/high should sit on the correct side of
+    # entry_price (below for long, above for short). If it doesn't -- e.g. a
+    # fast-moving entry-1 candle that closed/traded past the entry price --
+    # abs() below would silently mask an inverted stop, so catch it explicitly.
+    if (is_long and new_sl >= trade.entry_price) or ((not is_long) and new_sl <= trade.entry_price):
+        return None  # malformed/inverted SL, skip rather than risk a nonsensical stop
+
+    trade.sl_price = round(new_sl, 2)
+
+    # Fixed-risk position sizing (uses the NEW entry-1 based SL)
     risk_per_share = abs(trade.entry_price - trade.sl_price)
     trade.qty = max(1, math.floor(Config.RISK_PER_TRADE / risk_per_share)) if risk_per_share > 0 else 0
     if trade.qty <= 0:
@@ -906,6 +1070,27 @@ def summarize_trades(trades: list[Trade]) -> None:
     print(f"Avg win (Rs)            : {avg_win:,.2f}")
     print(f"Avg loss (Rs)           : {avg_loss:,.2f}")
     print("=" * 60)
+
+    # --- RSI condition breakdown (PDH short wants RSI>60, PDL long wants RSI<40) ---
+    has_rsi = df["rsi"].notna().any()
+    if has_rsi:
+        rsi_condition_met = (
+            ((df["side"] == "SHORT") & (df["rsi"] > Config.RSI_PDH_SHORT_THRESHOLD)) |
+            ((df["side"] == "LONG") & (df["rsi"] < Config.RSI_PDL_LONG_THRESHOLD))
+        )
+        for label, mask in [("RSI condition MET", rsi_condition_met),
+                             ("RSI condition NOT met", ~rsi_condition_met & df["rsi"].notna())]:
+            sub = df[mask]
+            if len(sub) == 0:
+                continue
+            sub_wins = (sub["pnl"] > 0).sum()
+            print(f"{label:24s}: trades={len(sub):4d}  win_rate={100*sub_wins/len(sub):6.2f}%  "
+                  f"total_pnl={sub['pnl'].sum():12,.2f}  avg_rr={sub['rr_achieved'].mean():6.3f}")
+        missing_rsi = df["rsi"].isna().sum()
+        if missing_rsi:
+            print(f"(Note: {missing_rsi} trade(s) had no RSI value available, excluded from the breakdown above)")
+        print("=" * 60)
+
     print("Full trade log saved to trade_log.csv")
     print("=" * 60 + "\n")
 
@@ -925,10 +1110,22 @@ def main():
 
     raw_data = load_or_fetch_all_symbols(smart_api, token_map)
 
+    log.info("Fetching daily candles for RSI(%d) calculation...", Config.RSI_PERIOD)
+    daily_data = load_or_fetch_daily_candles(smart_api, token_map)
+
     all_trades: list[Trade] = []
     for symbol, df in raw_data.items():
         try:
             df_ind = add_indicators(df)
+
+            daily_df = daily_data.get(symbol)
+            if daily_df is not None and not daily_df.empty:
+                daily_rsi = compute_daily_rsi(daily_df)
+                df_ind = attach_prev_day_rsi(df_ind, daily_rsi)
+            else:
+                df_ind["rsi"] = np.nan
+                log.warning("%s: no daily data available, RSI will be blank for this symbol", symbol)
+
             trades = backtest_symbol(symbol, df_ind)
             all_trades.extend(trades)
             log.info("%s: %d trade(s) generated", symbol, len(trades))
